@@ -218,3 +218,7 @@ Node is used only for the tests, not at run time.
 - Formats are whatever the browser can display: PNG, JPEG, GIF, WebP, SVG, BMP, ICO and
   AVIF in current browsers. TIFF, HEIC and RAW generally don't work.
 - Sandboxed (snap/Flatpak) browsers can only read images the sandbox allows.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
