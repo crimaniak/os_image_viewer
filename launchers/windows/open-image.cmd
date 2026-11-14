@@ -1,0 +1,3 @@
+@echo off
+rem Run the Image Viewer launcher from a terminal: open-image [-DryRun] FILE...
+powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0open-image.ps1" %*

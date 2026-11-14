@@ -1,0 +1,362 @@
+#!/bin/sh
+# open-image — image-viewer launcher for macOS (POSIX sh, no Python).
+#
+# Usage: open-image [-n|--dry-run] [FILE|file://URI ...]
+#        open-image --list-browsers        browsers usable as --browser values
+#        open-image --check-browser APP    check an app name, bundle id or .app path
+#
+# Opens each image in the browser-based viewer, in a window without tabs
+# where the browser allows it:
+#   Chromium family  -> --app=<url>
+#   Firefox family   -> dedicated profile whose userChrome.css hides tabs/toolbars
+#   Safari           -> new window via AppleScript
+#   anything else    -> plain window
+#
+# Browser choice: $IMAGE_VIEWER_BROWSER, else IMAGE_VIEWER_BROWSER from
+# ~/Library/Application Support/ImageViewer/config (app name, bundle id or .app path),
+# else the default browser. If that is Safari and Chrome/Chromium/Edge/Brave/
+# Vivaldi/Firefox is installed, that one is used (Safari restricts local files).
+
+set -u
+
+SUPPORT=$HOME/Library/Application\ Support/ImageViewer
+PLISTBUDDY=${PLISTBUDDY:-/usr/libexec/PlistBuddy}
+LS_PLIST=$HOME/Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure.plist
+DRY_RUN=0
+
+die() { printf 'open-image: %s\n' "$*" >&2; exit 1; }
+
+# ------------------------------------------------------------ url encoding --
+# urlencode STRING [keep-slash]: percent-encode every byte except RFC 3986
+# unreserved characters (and '/' when the second argument is "/").
+urlencode() {
+  printf '%s' "$1" | od -An -v -tx1 | awk -v keep="${2:-}" '
+    BEGIN { for (i = 0; i < 256; i++) v[sprintf("%02x", i)] = i }
+    {
+      for (i = 1; i <= NF; i++) {
+        c = v[$i]
+        if ((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) ||
+            c == 45 || c == 46 || c == 95 || c == 126 || (keep == "/" && c == 47))
+          printf "%c", c
+        else
+          printf "%%%s", toupper($i)
+      }
+    }'
+}
+
+lower() { printf '%s' "$1" | tr 'A-Z' 'a-z'; }
+
+# --------------------------------------------------------- viewer location --
+find_viewer() {
+  if [ -n "${IMAGE_VIEWER_DIR:-}" ]; then printf '%s\n' "$IMAGE_VIEWER_DIR"; return; fi
+  here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P) || return 1
+  if [ -f "$here/viewer/viewer.html" ]; then                 # inside the .app bundle
+    printf '%s\n' "$here/viewer"; return
+  fi
+  if [ -f "$here/../../viewer/viewer.html" ]; then           # source tree
+    (CDPATH= cd -- "$here/../../viewer" && pwd -P); return
+  fi
+  return 1
+}
+
+# ------------------------------------------------------------- app lookup --
+bundle_id_of() {
+  "$PLISTBUDDY" -c 'Print :CFBundleIdentifier' "$1/Contents/Info.plist" 2>/dev/null
+}
+
+# Bundle id -> .app path (Spotlight first, then the usual folders). Never launches the app.
+app_for_id() {
+  want=$(lower "$1")
+  if command -v mdfind >/dev/null 2>&1; then
+    p=$(mdfind "kMDItemCFBundleIdentifier == '$1'c" 2>/dev/null | grep '\.app$' | sed -n 1p)
+    if [ -n "$p" ] && [ -d "$p" ]; then printf '%s\n' "$p"; return 0; fi
+  fi
+  for a in /Applications/*.app "$HOME"/Applications/*.app /System/Applications/*.app \
+           /System/Volumes/Preboot/Cryptexes/App/System/Applications/*.app; do
+    [ -d "$a" ] || continue
+    if [ "$(lower "$(bundle_id_of "$a")")" = "$want" ]; then printf '%s\n' "$a"; return 0; fi
+  done
+  return 1
+}
+
+# Config value (app path, app name or bundle id) -> .app path.
+resolve_app() {
+  v=$1
+  case $v in */*.app|*/*.app/) [ -d "$v" ] && { printf '%s\n' "${v%/}"; return 0; } ;; esac
+  for d in /Applications "$HOME/Applications" /System/Applications; do
+    [ -d "$d/$v.app" ] && { printf '%s\n' "$d/$v.app"; return 0; }
+  done
+  if command -v mdfind >/dev/null 2>&1; then
+    p=$(mdfind "kMDItemContentType == 'com.apple.application-bundle' && kMDItemFSName == '$v.app'c" \
+          2>/dev/null | sed -n 1p)
+    if [ -n "$p" ] && [ -d "$p" ]; then printf '%s\n' "$p"; return 0; fi
+  fi
+  app_for_id "$v"
+}
+
+# Bundle id of the default https (or http) handler, from LaunchServices prefs.
+default_browser_id() {
+  [ -f "$LS_PLIST" ] || return 1
+  defaults read "$LS_PLIST" LSHandlers 2>/dev/null | awk '
+    {
+      line = $0
+      opens = gsub(/\{/, "{", line); closes = gsub(/\}/, "}", line)
+      if (depth == 1 && opens == 0) {
+        if ($0 ~ /LSHandlerRoleAll = /) {
+          v = $0; sub(/.*LSHandlerRoleAll = /, "", v); sub(/;.*/, "", v); gsub(/"/, "", v); role = v
+        }
+        if ($0 ~ /LSHandlerURLScheme = /) {
+          v = $0; sub(/.*LSHandlerURLScheme = /, "", v); sub(/;.*/, "", v); gsub(/"/, "", v); scheme = v
+        }
+      }
+      depth += opens - closes
+      if (depth == 0 && (opens || closes)) {
+        if ((scheme == "https" || scheme == "http") && role != "" && !(scheme in found)) found[scheme] = role
+        role = ""; scheme = ""
+      }
+    }
+    END { if ("https" in found) print found["https"]; else if ("http" in found) print found["http"] }'
+}
+
+PREFERRED_IDS="com.google.Chrome org.chromium.Chromium com.microsoft.edgemac com.brave.Browser com.vivaldi.Vivaldi org.mozilla.firefox"
+
+first_installed() {
+  for id in $PREFERRED_IDS; do
+    a=$(app_for_id "$id") && { printf '%s\n' "$a"; return 0; }
+  done
+  return 1
+}
+
+browser_family() {
+  case $(lower "$1") in
+    com.google.chrome*|org.chromium.*|com.microsoft.edgemac*|com.brave.browser*|com.vivaldi.*|com.operasoftware.*|ru.yandex.*)
+      echo chromium ;;
+    org.mozilla.*|net.waterfox.*|io.gitlab.librewolf*|org.torproject.*|one.ablaze.floorp*)
+      echo firefox ;;
+    com.apple.safari*) echo safari ;;
+    *) echo generic ;;
+  esac
+}
+
+# ------------------------------------------------------- firefox profile --
+ensure_ff_profile() {
+  prof=$1
+  mkdir -p "$prof/chrome" || die "cannot create $prof"
+  cat > "$prof/user.js" <<'EOF'
+// Written by open-image; regenerated on every launch.
+user_pref("toolkit.legacyUserProfileCustomizations.stylesheets", true);
+user_pref("browser.tabs.inTitlebar", 0);
+user_pref("browser.toolbars.bookmarks.visibility", "never");
+user_pref("sidebar.revamp", false);
+user_pref("sidebar.verticalTabs", false);
+user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("browser.aboutwelcome.enabled", false);
+user_pref("trailhead.firstrun.didSeeAboutWelcome", true);
+user_pref("startup.homepage_welcome_url", "");
+user_pref("startup.homepage_welcome_url.additional", "");
+user_pref("browser.startup.homepage_override.mstone", "ignore");
+user_pref("browser.startup.upgradeDialog.enabled", false);
+user_pref("browser.startup.page", 0);
+user_pref("browser.startup.homepage", "about:blank");
+user_pref("browser.sessionstore.resume_from_crash", false);
+user_pref("browser.sessionstore.max_resumed_crashes", 0);
+user_pref("browser.tabs.warnOnClose", false);
+user_pref("browser.warnOnQuit", false);
+user_pref("browser.tabs.closeWindowWithLastTab", true);
+user_pref("datareporting.policy.dataSubmissionEnabled", false);
+user_pref("datareporting.policy.dataSubmissionPolicyBypassNotification", true);
+user_pref("datareporting.healthreport.uploadEnabled", false);
+user_pref("toolkit.telemetry.reportingpolicy.firstRun", false);
+user_pref("app.normandy.enabled", false);
+user_pref("browser.newtabpage.enabled", false);
+EOF
+  cat > "$prof/chrome/userChrome.css" <<'EOF'
+/* Written by open-image: hide tabs, toolbars and sidebars. */
+#TabsToolbar,
+#nav-bar,
+#PersonalToolbar,
+#sidebar-main,
+#sidebar-box,
+#sidebar-splitter,
+#sidebar-launcher-splitter {
+  visibility: collapse !important;
+}
+EOF
+}
+
+# ------------------------------------------------- checking and listing --
+window_mode() {
+  case $(browser_family "$1") in
+    chromium) echo "app window, no tabs" ;;
+    firefox)  echo "own Firefox profile, no tabs" ;;
+    safari)   echo "Safari window, with tabs" ;;
+    *)        echo "normal browser window" ;;
+  esac
+}
+
+handles_http() {
+  "$PLISTBUDDY" -c 'Print :CFBundleURLTypes' "$1/Contents/Info.plist" 2>/dev/null |
+    grep -q -E '^[[:space:]]*https?[[:space:]]*$'
+}
+
+# Every .app that declares http/https links (Spotlight plus the usual folders).
+all_apps() {
+  if command -v mdfind >/dev/null 2>&1; then
+    mdfind "kMDItemContentType == 'com.apple.application-bundle'" 2>/dev/null
+  fi
+  for a in /Applications/*.app "$HOME"/Applications/*.app /System/Applications/*.app \
+           /System/Volumes/Preboot/Cryptexes/App/System/Applications/*.app; do
+    [ -d "$a" ] && printf '%s\n' "$a"
+  done
+}
+
+list_browsers() {
+  dkey=$(default_browser_id 2>/dev/null) || dkey=
+  [ -n "$dkey" ] || dkey=com.apple.Safari
+  dkey=$(lower "$dkey")
+  ukey=; [ -n "$APP" ] && ukey=$(lower "$(bundle_id_of "$APP")")
+  echo "Browsers found (use the first column as the --browser value):"
+  echo
+  all_apps | grep -v '\.app/.' | {
+    seen=" "
+    while IFS= read -r a; do
+      [ -d "$a" ] && handles_http "$a" || continue
+      id=$(bundle_id_of "$a") || continue
+      k=$(lower "$id")
+      case $seen in *" $k "*) continue ;; esac
+      [ "$k" = local.image-viewer ] && continue
+      seen="$seen$k "
+      name=${a##*/}; name=${name%.app}
+      v=$name
+      [ "$(resolve_app "$name")" = "$a" ] || v=$id
+      note=
+      [ "$k" = "$dkey" ] && note="system default"
+      [ "$k" = "$ukey" ] && note="${note:+$note, }in use"
+      case $v in *' '*) v="\"$v\"" ;; esac
+      printf '%s\t%s\t%s\t%s\n' "$v" "$id" "$(window_mode "$id")" "$note"
+    done
+  } | awk -F '\t' '
+    { for (c = 1; c <= 4; c++) { f[NR, c] = $c; if (length($c) > w[c]) w[c] = length($c) } }
+    END {
+      if (NR == 0) { print "  (none found)"; exit }
+      split("VALUE BUNDLE-ID WINDOW NOTE", h, " ")
+      for (c = 1; c <= 3; c++) if (w[c] < length(h[c])) w[c] = length(h[c])
+      fmt = "  %-" w[1] "s  %-" w[2] "s  %-" w[3] "s  %s\n"
+      printf fmt, h[1], h[2], h[3], h[4]
+      for (i = 1; i <= NR; i++) printf fmt, f[i, 1], f[i, 2], f[i, 3], f[i, 4]
+    }' | sed 's/[[:space:]]*$//'
+  echo
+  if [ -n "$APP" ]; then
+    echo "In use now: $APP ($APP_FROM)"
+  else
+    echo "In use now: none ($APP_FROM)"
+  fi
+  echo "An app name, a bundle id or the path to a .app all work as values."
+}
+
+# Sets APP (path to the .app) and APP_FROM; status 1 if nothing usable is found.
+pick_app() {
+  APP=; APP_FROM=
+  if [ -n "${IMAGE_VIEWER_BROWSER:-}" ]; then
+    APP_FROM="IMAGE_VIEWER_BROWSER environment variable"
+  elif [ -f "$SUPPORT/config" ]; then
+    . "$SUPPORT/config"
+    APP_FROM="config file $SUPPORT/config"
+  fi
+  if [ -n "${IMAGE_VIEWER_BROWSER:-}" ]; then
+    APP=$(resolve_app "$IMAGE_VIEWER_BROWSER") && return 0
+    APP=; APP_FROM="$APP_FROM: browser not found: $IMAGE_VIEWER_BROWSER"; return 1
+  fi
+  APP_FROM="system default"
+  id=$(default_browser_id) || id=
+  [ -n "$id" ] || id=com.apple.Safari                 # no LSHandlers entry = Safari
+  if [ "$(browser_family "$id")" = safari ]; then
+    APP=$(first_installed) && { APP_FROM="installed browser preferred over Safari"; return 0; }
+  fi
+  APP=$(app_for_id "$id") && return 0
+  APP_FROM="first installed browser"
+  APP=$(first_installed) && return 0
+  APP=$(app_for_id com.apple.Safari) && return 0
+  APP=; APP_FROM="no browser found"; return 1
+}
+
+# A copy of viewer.html that carries the image in window.SRC, for browsers
+# that might drop the ?src= query when a file:// URL is handed to them by `open`.
+make_redirect_page() {
+  page=$(mktemp "${TMPDIR:-/tmp}/image-viewer.XXXXXX") || die "mktemp failed"
+  mv "$page" "$page.html" && page=$page.html
+  base="file://$(urlencode "$VIEWER_DIR" /)/"
+  sed -e "s|<head>|<head><base href=\"$base\"><script>window.SRC=\"$1\";</script>|" \
+    "$VIEWER_DIR/viewer.html" > "$page" || die "cannot write $page"
+  printf '%s\n' "$page"
+}
+
+# ------------------------------------------------------------------- main --
+while [ $# -gt 0 ]; do
+  case $1 in
+    -n|--dry-run) DRY_RUN=1; shift ;;
+    --list-browsers) pick_app; list_browsers; exit 0 ;;
+    --check-browser)
+      [ $# -ge 2 ] && [ -n "$2" ] || die "--check-browser needs an app name, bundle id or .app path"
+      a=$(resolve_app "$2") || { echo "browser not found: $2" >&2; exit 1; }
+      id=$(bundle_id_of "$a") || id=unknown
+      printf '%s -> %s (%s; %s)\n' "$2" "$a" "$id" "$(window_mode "$id")"
+      [ "$(browser_family "$id")" != generic ] ||
+        echo "note: not a known browser; it gets a page that opens the image" >&2
+      exit 0 ;;
+    -h|--help) sed -n '2,19s/^# \{0,1\}//p' "$0"; exit 0 ;;
+    --) shift; break ;;
+    -*) die "unknown option: $1" ;;
+    *) break ;;
+  esac
+done
+
+VIEWER_DIR=$(find_viewer) || die "viewer files not found (run install-macos.sh)"
+pick_app || die "$APP_FROM"
+
+BID=$(bundle_id_of "$APP") || BID=
+FAMILY=$(browser_family "$BID")
+PROFILE=$SUPPORT/firefox-profile
+[ "$FAMILY" = firefox ] && [ $DRY_RUN = 0 ] && ensure_ff_profile "$PROFILE"
+
+VIEWER_URL="file://$(urlencode "$VIEWER_DIR/viewer.html" /)"
+
+run() {
+  if [ $DRY_RUN = 1 ]; then
+    for a in "$@"; do printf '[%s] ' "$a"; done; echo
+  else
+    "$@" >/dev/null 2>&1 || die "failed to start: $*"
+  fi
+}
+
+open_one() {
+  url=$VIEWER_URL; src=
+  if [ $# -gt 0 ]; then
+    f=$1
+    case $f in
+      file://*) src=$f ;;
+      /*) src="file://$(urlencode "$f" /)" ;;
+      *) src="file://$(urlencode "$PWD/$f" /)" ;;
+    esac
+    url="$url?src=$(urlencode "$src")"
+  fi
+  case $FAMILY in
+    chromium) run open -na "$APP" --args "--app=$url" ;;
+    firefox)  run open -na "$APP" --args -profile "$PROFILE" -new-window "$url" ;;
+    safari)   run osascript -e 'on run argv' \
+                -e 'tell application "Safari"' \
+                -e 'make new document with properties {URL:(item 1 of argv)}' \
+                -e 'activate' -e 'end tell' -e 'end run' "$url" ;;
+    *)        if [ -n "$src" ] && [ $DRY_RUN = 0 ]; then
+                run open -a "$APP" "$(make_redirect_page "$src")"
+              else
+                run open -a "$APP" "$url"
+              fi ;;
+  esac
+}
+
+if [ $# -eq 0 ]; then
+  open_one
+else
+  for file in "$@"; do open_one "$file"; done
+fi

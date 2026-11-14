@@ -1,0 +1,417 @@
+#!/bin/sh
+# open-image — image-viewer launcher for Linux (POSIX sh, no Python).
+#
+# Usage: open-image [-n|--dry-run] [FILE|file://URI ...]
+#        open-image --list-browsers          browsers usable as --browser values
+#        open-image --check-browser COMMAND  check a browser command, exit 1 if unusable
+#
+# Opens each image in the browser-based viewer, in a window without tabs
+# where the browser allows it:
+#   Chromium family  -> --app=<url>
+#   Firefox family   -> dedicated profile whose userChrome.css hides tabs/toolbars
+#   anything else    -> plain new window
+#
+# Browser choice: $IMAGE_VIEWER_BROWSER, else IMAGE_VIEWER_BROWSER from
+# ${XDG_CONFIG_HOME:-~/.config}/image-viewer/config, else the system default
+# browser, else the first installed of Chrome, Chromium, Edge, Brave, Vivaldi, Firefox.
+
+set -u
+
+DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
+CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
+APP_DIR=$DATA_HOME/image-viewer
+DRY_RUN=0
+
+die() { printf 'open-image: %s\n' "$*" >&2; exit 1; }
+
+# ------------------------------------------------------------ url encoding --
+# urlencode STRING [keep-slash]: percent-encode every byte except RFC 3986
+# unreserved characters (and '/' when the second argument is "/").
+urlencode() {
+  printf '%s' "$1" | od -An -v -tx1 | awk -v keep="${2:-}" '
+    BEGIN { for (i = 0; i < 256; i++) v[sprintf("%02x", i)] = i }
+    {
+      for (i = 1; i <= NF; i++) {
+        c = v[$i]
+        if ((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) ||
+            c == 45 || c == 46 || c == 95 || c == 126 || (keep == "/" && c == 47))
+          printf "%c", c
+        else
+          printf "%%%s", toupper($i)
+      }
+    }'
+}
+
+# --------------------------------------------------------- viewer location --
+find_viewer_src() {
+  if [ -n "${IMAGE_VIEWER_DIR:-}" ]; then
+    printf '%s\n' "$IMAGE_VIEWER_DIR"; return
+  fi
+  if [ -f "$APP_DIR/viewer/viewer.html" ]; then
+    printf '%s\n' "$APP_DIR/viewer"; return
+  fi
+  # Running from the source tree: launchers/linux/open-image -> viewer/
+  here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P) || return 1
+  if [ -f "$here/../../viewer/viewer.html" ]; then
+    (CDPATH= cd -- "$here/../../viewer" && pwd -P); return
+  fi
+  return 1
+}
+
+# ------------------------------------------------------- browser discovery --
+# Prints the Exec line (field codes removed) of the default browser.
+default_browser_exec() {
+  command -v xdg-settings >/dev/null 2>&1 || return 1
+  id=$(xdg-settings get default-web-browser 2>/dev/null) || return 1
+  [ -n "$id" ] || return 1
+  printf '%s:%s\n' "$DATA_HOME" "${XDG_DATA_DIRS:-/usr/local/share:/usr/share}" |
+    tr ':' '\n' |
+    while IFS= read -r d; do
+      [ -n "$d" ] && [ -f "$d/applications/$id" ] || continue
+      awk '/^\[/ { g = $0 }
+           g == "[Desktop Entry]" && /^Exec=/ { sub(/^Exec=/, ""); print; exit }' \
+        "$d/applications/$id"
+      break
+    done | sed -e 's/%[A-Za-z]//g' -e 's/@@[A-Za-z]*//g' -e 's/[[:space:]]*$//'
+}
+
+fallback_browser() {
+  for c in google-chrome-stable google-chrome chromium chromium-browser \
+           microsoft-edge-stable microsoft-edge brave-browser vivaldi-stable \
+           vivaldi firefox; do
+    if command -v "$c" >/dev/null 2>&1; then printf '%s\n' "$c"; return 0; fi
+  done
+  return 1
+}
+
+# First real command word of a command line (skips "env" and VAR=value).
+main_command() {
+  eval "set -- $1"
+  for w in "$@"; do
+    case $w in env|*=*) continue ;; *) printf '%s\n' "$w"; return ;; esac
+  done
+}
+
+browser_family() {
+  lc=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
+  case $lc in
+    *chrom*|*edge*|*brave*|*vivaldi*|*opera*|*yandex*) echo chromium ;;
+    *firefox*|*librewolf*|*waterfox*|*floorp*|*icecat*) echo firefox ;;
+    *) echo generic ;;
+  esac
+}
+
+# Snap name if the command is a snap (incl. Ubuntu's /usr/bin wrapper scripts).
+snap_name() {
+  p=$(command -v -- "$1" 2>/dev/null) || return 1
+  case $p in
+    /snap/bin/*) n=${p##*/}; printf '%s\n' "${n%%.*}"; return 0 ;;
+  esac
+  [ -f "$p" ] && sed -n 1p "$p" | grep -q '^#!' || return 1
+  s=$(grep -o 'exec /snap/bin/[A-Za-z0-9_-]*' "$p" 2>/dev/null | sed -n 1p)
+  [ -n "$s" ] || return 1
+  printf '%s\n' "${s##*/}"
+}
+
+# Flatpak app id if the command line is "flatpak run ... <app-id> ...".
+flatpak_id() {
+  eval "set -- $1"
+  seen_run=0
+  for w in "$@"; do
+    case $w in
+      run) seen_run=1 ;;
+      -*) ;;
+      *) if [ $seen_run = 1 ]; then printf '%s\n' "$w"; return 0; fi ;;
+    esac
+  done
+  return 1
+}
+
+# ------------------------------------------------- checking and listing --
+# Installed program for a command line, or an error on stderr and status 1.
+# Status 2: the command is usable but not a known browser (plain window).
+check_browser() {
+  v=$1
+  [ -n "$v" ] || { echo "empty browser command" >&2; return 1; }
+  ( eval "set -- $v" ) >/dev/null 2>&1 || { echo "cannot parse '$v' (check the quotes)" >&2; return 1; }
+  c=$(main_command "$v")
+  [ -n "$c" ] || { echo "no program in '$v'" >&2; return 1; }
+  p=$(command -v -- "$c" 2>/dev/null) || p=
+  case $p in
+    */*) [ -f "$p" ] && [ -x "$p" ] || p= ;;
+    *) p= ;;                                  # builtin, alias or function
+  esac
+  [ -n "$p" ] || { echo "program not found: $c" >&2; return 1; }
+  if id=$(flatpak_id "$v") && command -v flatpak >/dev/null 2>&1; then
+    flatpak info "$id" >/dev/null 2>&1 || { echo "flatpak app not installed: $id" >&2; return 1; }
+  fi
+  printf '%s\n' "$p"
+  [ "$(browser_family "$v")" != generic ] || return 2
+}
+
+window_mode() {
+  case $(browser_family "$1") in
+    chromium) echo "app window, no tabs" ;;
+    firefox)  echo "own Firefox profile, no tabs" ;;
+    *)        echo "normal browser window" ;;
+  esac
+}
+
+# Same key for two command lines that start the same browser.
+browser_key() {
+  if s=$(snap_name "$(main_command "$1")"); then echo "snap:$s"; return; fi
+  if f=$(flatpak_id "$1"); then echo "flatpak:$f"; return; fi
+  p=$(command -v -- "$(main_command "$1")" 2>/dev/null) || { echo "cmd:$1"; return; }
+  readlink -f -- "$p" 2>/dev/null || echo "$p"
+}
+
+# Shortest command line for a desktop Exec value (field codes already removed).
+short_command() {
+  eval "set -- $1"
+  while [ $# -gt 0 ]; do case $1 in env|*=*) shift ;; *) break ;; esac; done
+  [ $# -gt 0 ] || return 1
+  case ${1##*/} in
+    flatpak)
+      if id=$(flatpak_id "$*"); then echo "flatpak run $id"; return; fi ;;
+  esac
+  if [ $# -eq 1 ]; then
+    b=${1##*/}
+    if [ "$(command -v -- "$b" 2>/dev/null)" = "$1" ]; then echo "$b"; else echo "$1"; fi
+    return
+  fi
+  for w in "$@"; do
+    case $w in *[!A-Za-z0-9_./=:,+-]*) printf "'%s' " "$(printf '%s' "$w" | sed "s/'/'\\\\''/g")" ;;
+               *) printf '%s ' "$w" ;; esac
+  done | sed 's/ $//'
+  echo
+}
+
+# Exec lines of applications that handle http links (one per desktop id).
+desktop_browsers() {
+  printf '%s:%s\n' "$DATA_HOME" "${XDG_DATA_DIRS:-/usr/local/share:/usr/share}" |
+    tr ':' '\n' |
+    while IFS= read -r d; do
+      [ -n "$d" ] && [ -d "$d/applications" ] || continue
+      set --
+      for f in "$d"/applications/*.desktop; do
+        [ -f "$f" ] && [ -r "$f" ] && set -- "$@" "$f"   # skips dangling symlinks
+      done
+      [ $# -gt 0 ] || continue
+      awk '
+        function flush() {
+          if (id == "") return
+          # Exec lines with $ or ` are skipped: they are eval-ed later, never run code.
+          ok = (mime ~ /[=;]x-scheme-handler\/https?(;|$)/ && ex != "" && !hide && ex !~ /[$`]/)
+          printf "%s\t%s\t%s\n", id, (ok ? "y" : "n"), ex
+        }
+        FNR == 1 { flush(); id = FILENAME; sub(/.*\//, "", id); g = ex = mime = ""; hide = 0 }
+        /^\[/ { g = $0; next }
+        g != "[Desktop Entry]" { next }
+        /^Exec=/ && ex == "" { ex = substr($0, 6) }
+        /^MimeType=/ { mime = $0 }
+        /^(NoDisplay|Hidden)=true/ { hide = 1 }
+        END { flush() }' "$@"
+    done |
+    awk -F '\t' '!seen[$1]++ && $2 == "y" { print $3 }' |
+    sed -e 's/%[A-Za-z]//g' -e 's/@@[A-Za-z]*//g' -e 's/[[:space:]]*$//'
+}
+
+KNOWN_BROWSERS="google-chrome google-chrome-stable chromium chromium-browser microsoft-edge
+  microsoft-edge-stable brave-browser brave vivaldi vivaldi-stable opera yandex-browser
+  firefox firefox-esr librewolf waterfox floorp"
+
+list_browsers() {
+  default=$(default_browser_exec 2>/dev/null) || default=
+  dkey=; [ -n "$default" ] && dkey=$(browser_key "$default")
+  ukey=; [ -n "$BROWSER" ] && ukey=$(browser_key "$BROWSER")
+  echo "Browsers found (use the first column as the --browser value):"
+  echo
+  { for c in $KNOWN_BROWSERS; do command -v -- "$c" >/dev/null 2>&1 && echo "$c"; done
+    desktop_browsers | while IFS= read -r e; do short_command "$e"; done
+  } | {
+    seen=" "
+    while IFS= read -r v; do
+      [ -n "$v" ] || continue
+      case $(main_command "$v") in false|true|*/false|*/true) continue ;; esac  # placeholders
+      check_browser "$v" >/dev/null 2>&1; [ $? -ne 1 ] || continue
+      k=$(browser_key "$v")
+      case $seen in *" $k "*) continue ;; esac
+      seen="$seen$k "
+      note=
+      case $k in snap:*) note=snap ;; flatpak:*) note=flatpak ;; esac
+      [ "$k" = "$dkey" ] && note="${note:+$note, }system default"
+      [ "$k" = "$ukey" ] && note="${note:+$note, }in use"
+      case $v in *' '*) shown="\"$v\"" ;; *) shown=$v ;; esac
+      printf '%s\t%s\t%s\n' "$shown" "$(window_mode "$v")" "$note"
+    done
+  } | awk -F '\t' '
+    { v[NR] = $1; w[NR] = $2; n[NR] = $3
+      if (length($1) > a) a = length($1); if (length($2) > b) b = length($2) }
+    END {
+      if (NR == 0) { print "  (none found)"; exit }
+      if (a < 5) a = 5; if (b < 6) b = 6
+      printf "  %-" a "s  %-" b "s  %s\n", "VALUE", "WINDOW", "NOTE"
+      for (i = 1; i <= NR; i++) printf "  %-" a "s  %-" b "s  %s\n", v[i], w[i], n[i]
+    }' | sed 's/[[:space:]]*$//'
+  echo
+  if [ -n "$BROWSER" ]; then
+    echo "In use now: $BROWSER ($BROWSER_FROM)"
+  else
+    echo "In use now: none ($BROWSER_FROM)"
+  fi
+  echo "Any other command works too, e.g. a full path or a command with options."
+}
+
+# Sets BROWSER and BROWSER_FROM; status 1 if nothing usable is found.
+pick_browser() {
+  BROWSER=; BROWSER_FROM=
+  if [ -n "${IMAGE_VIEWER_BROWSER:-}" ]; then
+    BROWSER_FROM="IMAGE_VIEWER_BROWSER environment variable"
+  elif [ -f "$CONFIG_HOME/image-viewer/config" ]; then
+    . "$CONFIG_HOME/image-viewer/config"
+    BROWSER_FROM="config file $CONFIG_HOME/image-viewer/config"
+  fi
+  if [ -n "${IMAGE_VIEWER_BROWSER:-}" ]; then
+    BROWSER=$IMAGE_VIEWER_BROWSER
+    err=$(check_browser "$BROWSER" 2>&1 >/dev/null)
+    [ $? -ne 1 ] || { BROWSER_FROM="$BROWSER_FROM: $err"; BROWSER=; return 1; }
+    return 0
+  fi
+  BROWSER=$(default_browser_exec 2>/dev/null) || BROWSER=
+  if [ -n "$BROWSER" ]; then
+    cmd=$(main_command "$BROWSER")
+    if command -v -- "$cmd" >/dev/null 2>&1; then BROWSER_FROM="system default"; return 0; fi
+  fi
+  BROWSER=$(fallback_browser) || { BROWSER=; BROWSER_FROM="no supported browser found"; return 1; }
+  BROWSER_FROM="first installed browser"
+}
+
+# ------------------------------------------------------- firefox profile --
+ensure_ff_profile() {
+  prof=$1
+  mkdir -p "$prof/chrome" || die "cannot create $prof"
+  cat > "$prof/user.js" <<'EOF'
+// Written by open-image; regenerated on every launch.
+user_pref("toolkit.legacyUserProfileCustomizations.stylesheets", true);
+user_pref("browser.tabs.inTitlebar", 0);
+user_pref("browser.toolbars.bookmarks.visibility", "never");
+user_pref("sidebar.revamp", false);
+user_pref("sidebar.verticalTabs", false);
+user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("browser.aboutwelcome.enabled", false);
+user_pref("trailhead.firstrun.didSeeAboutWelcome", true);
+user_pref("startup.homepage_welcome_url", "");
+user_pref("startup.homepage_welcome_url.additional", "");
+user_pref("browser.startup.homepage_override.mstone", "ignore");
+user_pref("browser.startup.upgradeDialog.enabled", false);
+user_pref("browser.startup.page", 0);
+user_pref("browser.startup.homepage", "about:blank");
+user_pref("browser.sessionstore.resume_from_crash", false);
+user_pref("browser.sessionstore.max_resumed_crashes", 0);
+user_pref("browser.tabs.warnOnClose", false);
+user_pref("browser.warnOnQuit", false);
+user_pref("browser.tabs.closeWindowWithLastTab", true);
+user_pref("datareporting.policy.dataSubmissionEnabled", false);
+user_pref("datareporting.policy.dataSubmissionPolicyBypassNotification", true);
+user_pref("datareporting.healthreport.uploadEnabled", false);
+user_pref("toolkit.telemetry.reportingpolicy.firstRun", false);
+user_pref("app.normandy.enabled", false);
+user_pref("browser.newtabpage.enabled", false);
+EOF
+  cat > "$prof/chrome/userChrome.css" <<'EOF'
+/* Written by open-image: hide tabs, toolbars and sidebars. */
+#TabsToolbar,
+#nav-bar,
+#PersonalToolbar,
+#sidebar-main,
+#sidebar-box,
+#sidebar-splitter,
+#sidebar-launcher-splitter {
+  visibility: collapse !important;
+}
+EOF
+}
+
+# ------------------------------------------------------------------- main --
+usage() {
+  sed -n '2,17s/^# \{0,1\}//p' "$0"
+  exit 0
+}
+
+while [ $# -gt 0 ]; do
+  case $1 in
+    -n|--dry-run) DRY_RUN=1; shift ;;
+    --list-browsers) pick_browser; list_browsers; exit 0 ;;
+    --check-browser)
+      [ $# -ge 2 ] || die "--check-browser needs a command"
+      p=$(check_browser "$2"); rc=$?
+      [ $rc -ne 1 ] || exit 1
+      printf '%s -> %s (%s)\n' "$2" "$p" "$(window_mode "$2")"
+      [ $rc -eq 0 ] || echo "note: not a known browser; it gets the viewer URL as its last argument" >&2
+      exit 0 ;;
+    -h|--help) usage ;;
+    --) shift; break ;;
+    -*) die "unknown option: $1" ;;
+    *) break ;;
+  esac
+done
+
+VIEWER_SRC=$(find_viewer_src) || die "viewer files not found (run install-linux.sh)"
+pick_browser || die "$BROWSER_FROM"
+
+FAMILY=$(browser_family "$BROWSER")
+CMD=$(main_command "$BROWSER")
+
+# Sandboxed browsers can't read ~/.local/share; give them a copy in their own dir.
+BASE=$APP_DIR
+if SNAP=$(snap_name "$CMD"); then
+  BASE=$HOME/snap/$SNAP/common/image-viewer
+elif FP=$(flatpak_id "$BROWSER"); then
+  BASE=$HOME/.var/app/$FP/data/image-viewer
+fi
+if [ "$BASE" != "$APP_DIR" ] && [ $DRY_RUN = 0 ]; then
+  mkdir -p "$BASE/viewer" && cp -f "$VIEWER_SRC"/viewer.html "$VIEWER_SRC"/viewer.css \
+    "$VIEWER_SRC"/viewer.js "$BASE/viewer/" || die "cannot copy viewer to $BASE"
+  VIEWER_DIR=$BASE/viewer
+elif [ "$BASE" != "$APP_DIR" ]; then
+  VIEWER_DIR=$BASE/viewer
+else
+  VIEWER_DIR=$VIEWER_SRC
+fi
+
+PROFILE=$BASE/firefox-profile
+if [ "$FAMILY" = firefox ] && [ $DRY_RUN = 0 ]; then
+  ensure_ff_profile "$PROFILE"
+fi
+
+VIEWER_URL="file://$(urlencode "$VIEWER_DIR/viewer.html" /)"
+
+# open_one [FILE]: runs in its own positional-parameter scope.
+open_one() {
+  url=$VIEWER_URL
+  if [ $# -gt 0 ]; then
+    f=$1
+    case $f in
+      /*|file://*) ;;
+      *) f=$PWD/$f ;;
+    esac
+    url="$url?src=$(urlencode "$f")"
+  fi
+  eval "set -- $BROWSER"
+  case $FAMILY in
+    chromium) set -- "$@" "--app=$url" ;;
+    firefox)  set -- "$@" --profile "$PROFILE" --new-window "$url" ;;
+    *)        set -- "$@" "$url" ;;
+  esac
+  if [ $DRY_RUN = 1 ]; then
+    printf '%s\n' "$*"
+  else
+    nohup "$@" >/dev/null 2>&1 &
+  fi
+}
+
+if [ $# -eq 0 ]; then
+  open_one
+else
+  for file in "$@"; do open_one "$file"; done
+fi

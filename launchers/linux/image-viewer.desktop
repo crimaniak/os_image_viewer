@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Image Viewer
+GenericName=Image Viewer
+Comment=View images in a browser window
+Exec=@LAUNCHER@ %F
+TryExec=@LAUNCHER_TRYEXEC@
+Icon=image-x-generic
+Terminal=false
+StartupNotify=false
+Categories=Graphics;Viewer;
+MimeType=image/png;image/apng;image/jpeg;image/pjpeg;image/gif;image/webp;image/svg+xml;image/bmp;image/x-bmp;image/x-ms-bmp;image/vnd.microsoft.icon;image/x-icon;image/avif;
